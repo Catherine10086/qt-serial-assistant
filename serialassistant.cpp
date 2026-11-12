@@ -2,11 +2,11 @@
 #include "ui_serialassistant.h"
 #include <QMessageBox>
 #include <QDateTime>
-#include <QDebug>
+#include <QRegularExpression>
+#include <QTimer>
 
-// 定义静态成员：增加头尾效验
-const QByteArray SerialAssistant::START_DELIMITER = QByteArray::fromHex("AABB");
-const QByteArray SerialAssistant::END_DELIMITER = QByteArray::fromHex("CCDD");
+// 定义帧头静态成员（AABB）
+const QByteArray SerialAssistant::FRAME_HEADER = QByteArray::fromHex("AABB");
 
 // 在构造函数中打开日志文件
 SerialAssistant::SerialAssistant(QWidget *parent)
@@ -24,6 +24,12 @@ SerialAssistant::SerialAssistant(QWidget *parent)
     initSerialPort(); // 初始化串口设置
 
     connect(serial, &QSerialPort::readyRead, this, &SerialAssistant::readData); // 连接readyRead信号到readData槽
+    connect(serial, &QSerialPort::errorOccurred, this, &SerialAssistant::handleError); // 连接errorOccurred信号到handleError槽
+
+    // Windows 上拔线时 errorOccurred 不一定可靠触发，用定时器每秒轮询端口是否还在，作为兜底
+    QTimer *aliveTimer = new QTimer(this);
+    connect(aliveTimer, &QTimer::timeout, this, &SerialAssistant::checkPortAlive);
+    aliveTimer->start(1000);
 
     // 添加状态标签到状态栏
     statusBar()->addPermanentWidget(ui->packetLossLabel);
@@ -110,9 +116,28 @@ void SerialAssistant::on_openCloseButton_clicked()
 void SerialAssistant::on_sendButton_clicked()
 {
     if (serial->isOpen()) {
-        QByteArray data = ui->sendTextEdit->toPlainText().toUtf8(); // 获取要发送的数据
-        QByteArray packet = START_DELIMITER + data + END_DELIMITER; // 构建数据包
-        quint16 crc = calculateCRC(packet); // 计算CRC校验码
+        QByteArray data;
+        if (ui->hexSendCheckBox->isChecked()) {
+            // 十六进制发送：把输入当作 hex 字符串解析成原始字节
+            QString hexText = ui->sendTextEdit->toPlainText();
+            hexText.remove(QRegularExpression("\\s")); // 去掉所有空白字符
+            if (hexText.isEmpty() || hexText.size() % 2 != 0 ||
+                !QRegularExpression("^[0-9A-Fa-f]+$").match(hexText).hasMatch()) {
+                QMessageBox::warning(this, tr("警告"),
+                                     tr("十六进制格式错误！请输入合法的十六进制字符串，例如 AABB 或 31 12。"));
+                return;
+            }
+            data = QByteArray::fromHex(hexText.toLatin1()); // 转成原始字节
+        } else {
+            data = ui->sendTextEdit->toPlainText().toUtf8(); // 文本发送
+        }
+
+        // 按长度字段协议组帧：帧头 + 数据长度(2字节大端) + 数据体 + CRC
+        QByteArray packet = FRAME_HEADER;
+        packet.append((char)(data.size() >> 8));   // 长度字段高字节
+        packet.append((char)(data.size() & 0xFF)); // 长度字段低字节
+        packet.append(data);                        // 数据体
+        quint16 crc = calculateCRC(packet); // 计算CRC校验码（覆盖帧头+长度+数据体）
         packet.append((char)(crc >> 8)); // 添加高位CRC
         packet.append((char)(crc & 0xFF)); // 添加低位CRC
 
@@ -123,7 +148,6 @@ void SerialAssistant::on_sendButton_clicked()
             totalSentBytes += bytesWritten; // 更新发送字节数
             totalPacketsSent++; // 更新发送包数
             updateStatusBar(); // 更新状态栏
-            qDebug() << "Sent packet:" << packet.toHex(); // 调试输出发送的数据包
         }
     } else {
         QMessageBox::warning(this, tr("警告"), tr("串口未打开!")); // 弹出警告信息
@@ -133,36 +157,101 @@ void SerialAssistant::on_sendButton_clicked()
 // 读取数据
 void SerialAssistant::readData()
 {
-    receiveBuffer += serial->readAll(); // 读取所有可用数据到接收缓冲区
-    qDebug() << "Current buffer:" << receiveBuffer.toHex(); // 调试输出当前缓冲区数据
+    // 此处使用接收缓冲区解决高频数据下的粘包/拆包问题：
+    // 串口是字节流，一帧可能被拆成多次 readyRead，也可能多帧粘在一起一次到达，
+    // 所以先用 m_buffer 累积数据，再按长度字段协议拆出完整帧。
+    m_buffer.append(serial->readAll()); // 读取所有可用数据追加到接收缓冲区
 
-    while (receiveBuffer.contains(START_DELIMITER) && receiveBuffer.contains(END_DELIMITER)) {
-        int start = receiveBuffer.indexOf(START_DELIMITER); // 找到起始标志位置
-        int end = receiveBuffer.indexOf(END_DELIMITER, start + START_DELIMITER.size()); // 找到结束标志位置
+    while (true) {
+        // 至少需要帧头+长度字段才能判断一帧的长度
+        if (m_buffer.size() < FRAME_HEADER_SIZE + LENGTH_FIELD_SIZE) {
+            break;
+        }
 
-        if (start != -1 && end != -1) {
-            QByteArray packet = receiveBuffer.mid(start, end - start + END_DELIMITER.size() + 2); // +2 for CRC
-            receiveBuffer = receiveBuffer.mid(end + END_DELIMITER.size() + 2); // 更新接收缓冲区
+        // 帧头不对齐：丢弃一个字节重新同步，直到找到帧头
+        if (!m_buffer.startsWith(FRAME_HEADER)) {
+            m_buffer.remove(0, 1);
+            continue;
+        }
 
-            totalReceivedBytes += packet.size(); // 更新接收字节数
-            totalPacketsReceived++; // 更新接收包数
+        // 读取长度字段（2字节大端），表示数据体字节数
+        quint16 bodyLen = ((quint8)m_buffer[FRAME_HEADER_SIZE] << 8) |
+                          (quint8)m_buffer[FRAME_HEADER_SIZE + 1];
 
-            if (verifyCRC(packet)) {
-                QByteArray data = packet.mid(START_DELIMITER.size(), packet.size() - START_DELIMITER.size() - END_DELIMITER.size() - 2); // 提取数据
-                ui->receiveTextEdit->append(QString(data)); // 显示接收的数据
-                qDebug() << "Received valid packet. Data:" << data; // 调试输出接收到的数据
+        // 长度字段异常保护：防止坏长度导致缓冲区无限等待
+        if (bodyLen > MAX_FRAME_SIZE) {
+            m_buffer.remove(0, 1);
+            continue;
+        }
+
+        int frameSize = FRAME_HEADER_SIZE + LENGTH_FIELD_SIZE + bodyLen + CRC_SIZE;
+
+        // 帧还没收全，等待下一次 readyRead
+        if (m_buffer.size() < frameSize) {
+            break;
+        }
+
+        QByteArray packet = m_buffer.left(frameSize); // 取出完整一帧
+        m_buffer.remove(0, frameSize);                // 从缓冲区移除该帧
+
+        totalReceivedBytes += packet.size(); // 更新接收字节数
+        totalPacketsReceived++; // 更新接收包数
+
+        if (verifyCRC(packet)) {
+            QByteArray data = packet.mid(FRAME_HEADER_SIZE + LENGTH_FIELD_SIZE, bodyLen); // 提取数据体
+            if (ui->hexDisplayCheckBox->isChecked()) {
+                // 十六进制显示：把字节转成带空格的 hex 字符串
+                ui->receiveTextEdit->append(QString::fromLatin1(data.toHex(' ').toUpper()));
             } else {
-                ui->receiveTextEdit->append("接收到损坏的数据!"); // 显示接收到的损坏数据
-                lostPackets++; // 更新丢包数
-                logLostPacket(packet); // 记录丢包信息
-                qDebug() << "Received corrupted packet:" << packet.toHex(); // 调试输出接收到的损坏数据包
+                ui->receiveTextEdit->append(QString::fromUtf8(data)); // 文本显示
             }
         } else {
-            break; // 如果没有完整的数据包，则退出循环
+            ui->receiveTextEdit->append("接收到损坏的数据!"); // 显示接收到的损坏数据
+            lostPackets++; // 更新丢包数
+            logLostPacket(packet); // 记录丢包信息
         }
     }
 
     updateStatusBar(); // 更新状态栏
+}
+
+// 处理串口错误（如设备掉线）
+void SerialAssistant::handleError(QSerialPort::SerialPortError error)
+{
+    // ResourceError 表示设备被意外移除（如 USB 掉线）
+    if (error == QSerialPort::ResourceError) {
+        handleDeviceDisconnected();
+    }
+}
+
+// 定时检查当前打开的串口是否还存在于系统中（Windows 上拔线的兜底检测）
+void SerialAssistant::checkPortAlive()
+{
+    if (!serial->isOpen()) {
+        return; // 串口没打开，无需检查
+    }
+
+    const auto infos = QSerialPortInfo::availablePorts();
+    for (const QSerialPortInfo &info : infos) {
+        if (info.portName() == serial->portName()) {
+            return; // 串口还在，正常
+        }
+    }
+
+    handleDeviceDisconnected(); // 串口已从系统消失，视为掉线
+}
+
+// 统一的设备掉线处理：关串口、清缓冲、复位界面、提示用户
+void SerialAssistant::handleDeviceDisconnected()
+{
+    if (serial->isOpen()) {
+        serial->close(); // 关闭串口
+    }
+    m_buffer.clear(); // 清空接收缓冲区，避免残留半帧在重连后造成误判
+    ui->openCloseButton->setText("打开"); // 复位按钮状态
+    statusBar()->showMessage("设备已断开"); // 更新状态栏信息
+    QMessageBox::critical(this, tr("串口错误"), tr("设备已断开连接，串口已关闭！请重新插入设备。"));
+    updatePortList(); // 刷新端口列表（重插后端口号可能变化）
 }
 
 // 清空接收窗口按钮点击事件处理函数

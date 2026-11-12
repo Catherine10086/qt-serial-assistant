@@ -24,6 +24,8 @@ private slots:
     void on_openCloseButton_clicked();
     void on_sendButton_clicked();
     void readData();
+    void handleError(QSerialPort::SerialPortError error);
+    void checkPortAlive();
     void on_clearReceiveButton_clicked();
     void on_clearSendButton_clicked();
 
@@ -36,6 +38,7 @@ private:
     bool verifyCRC(const QByteArray &packet);
     void updateStatusBar();
     void logLostPacket(const QByteArray &packet);
+    void handleDeviceDisconnected();
 
     qint64 totalSentBytes;
     qint64 totalReceivedBytes;
@@ -43,10 +46,14 @@ private:
     int totalPacketsReceived;
     int lostPackets;
 
-    QByteArray receiveBuffer;
+    QByteArray m_buffer; // 接收缓冲区：累积数据，配合长度字段协议解决粘包/拆包
 
-    static const QByteArray START_DELIMITER;
-    static const QByteArray END_DELIMITER;
+    // 帧格式：帧头(2字节) + 数据长度(2字节 大端) + 数据体(N字节) + CRC(2字节)
+    static const QByteArray FRAME_HEADER;
+    static constexpr int FRAME_HEADER_SIZE = 2;
+    static constexpr int LENGTH_FIELD_SIZE = 2;
+    static constexpr int CRC_SIZE = 2;
+    static constexpr int MAX_FRAME_SIZE = 4096; // 数据体最大长度，防止坏长度导致缓冲区无限等待
     QFile logFile;
     QTextStream logStream;
 };
