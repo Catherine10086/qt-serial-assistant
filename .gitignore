@@ -1,0 +1,33 @@
+# Qt 构建产物
+build*/
+debug/
+release/
+*.o
+*.obj
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.pro.user
+.qmake.stash
+Makefile
+Makefile.*
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+ 
+# Visual Studio
+.vs/
+*.vsidx
+
+# 程序运行日志
+packet_log.txt
