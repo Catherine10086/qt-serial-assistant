@@ -24,6 +24,8 @@ private slots:
     void on_openCloseButton_clicked();
     void on_sendButton_clicked();
     void readData();
+    void handleError(QSerialPort::SerialPortError error);
+    void checkPortAlive();
     void on_clearReceiveButton_clicked();
     void on_clearSendButton_clicked();
 
@@ -36,6 +38,7 @@ private:
     bool verifyCRC(const QByteArray &packet);
     void updateStatusBar();
     void logLostPacket(const QByteArray &packet);
+    void handleDeviceDisconnected();
 
     qint64 totalSentBytes;
     qint64 totalReceivedBytes;

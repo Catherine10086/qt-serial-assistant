@@ -3,6 +3,7 @@
 #include <QMessageBox>
 #include <QDateTime>
 #include <QDebug>
+#include <QTimer>
 
 // 定义静态成员：增加头尾效验
 const QByteArray SerialAssistant::START_DELIMITER = QByteArray::fromHex("AABB");
@@ -24,6 +25,12 @@ SerialAssistant::SerialAssistant(QWidget *parent)
     initSerialPort(); // 初始化串口设置
 
     connect(serial, &QSerialPort::readyRead, this, &SerialAssistant::readData); // 连接readyRead信号到readData槽
+    connect(serial, &QSerialPort::errorOccurred, this, &SerialAssistant::handleError); // 连接errorOccurred信号到handleError槽
+
+    // Windows 上拔线时 errorOccurred 不一定可靠触发，用定时器每秒轮询端口是否还在，作为兜底
+    QTimer *aliveTimer = new QTimer(this);
+    connect(aliveTimer, &QTimer::timeout, this, &SerialAssistant::checkPortAlive);
+    aliveTimer->start(1000);
 
     // 添加状态标签到状态栏
     statusBar()->addPermanentWidget(ui->packetLossLabel);
@@ -163,6 +170,45 @@ void SerialAssistant::readData()
     }
 
     updateStatusBar(); // 更新状态栏
+}
+
+// 处理串口错误（如设备掉线）
+void SerialAssistant::handleError(QSerialPort::SerialPortError error)
+{
+    // ResourceError 表示设备被意外移除（如 USB 掉线）
+    if (error == QSerialPort::ResourceError) {
+        handleDeviceDisconnected();
+    }
+}
+
+// 定时检查当前打开的串口是否还存在于系统中（Windows 上拔线的兜底检测）
+void SerialAssistant::checkPortAlive()
+{
+    if (!serial->isOpen()) {
+        return; // 串口没打开，无需检查
+    }
+
+    const auto infos = QSerialPortInfo::availablePorts();
+    for (const QSerialPortInfo &info : infos) {
+        if (info.portName() == serial->portName()) {
+            return; // 串口还在，正常
+        }
+    }
+
+    handleDeviceDisconnected(); // 串口已从系统消失，视为掉线
+}
+
+// 统一的设备掉线处理：关串口、清缓冲、复位界面、提示用户
+void SerialAssistant::handleDeviceDisconnected()
+{
+    if (serial->isOpen()) {
+        serial->close(); // 关闭串口
+    }
+    receiveBuffer.clear(); // 清空接收缓冲区，避免残留半帧在重连后造成误判
+    ui->openCloseButton->setText("打开"); // 复位按钮状态
+    statusBar()->showMessage("设备已断开"); // 更新状态栏信息
+    QMessageBox::critical(this, tr("串口错误"), tr("设备已断开连接，串口已关闭！请重新插入设备。"));
+    updatePortList(); // 刷新端口列表（重插后端口号可能变化）
 }
 
 // 清空接收窗口按钮点击事件处理函数
